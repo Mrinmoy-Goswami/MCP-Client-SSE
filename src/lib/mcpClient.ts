@@ -8,7 +8,7 @@ export class MCPClient {
 
   private async makeRequest(method: 'GET' | 'POST' | 'DELETE', body?: any) {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      // MCP requires client to accept both content types
       'Accept': 'application/json, text/event-stream'
     };
 
@@ -16,104 +16,155 @@ export class MCPClient {
       headers['mcp-session-id'] = this.sessionId;
     }
 
-    const response = await fetch(this.baseUrl, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined
-    });
-
-    const newSessionId = response.headers.get('mcp-session-id');
-    if (newSessionId) this.sessionId = newSessionId;
-
-    // If it’s a notification or success with no body
-    if (response.status === 202 || response.status === 204) {
-      return null;
+    // Only add Content-Type for POST with body
+    if (method === 'POST' && body) {
+      headers['Content-Type'] = 'application/json';
     }
 
-    const contentType = response.headers.get("Content-Type") || "";
+    console.log('Making request:', {
+      method,
+      url: this.baseUrl,
+      headers,
+      body: body ? JSON.stringify(body, null, 2) : undefined
+    });
 
-    if (contentType.includes("application/json")) {
-      try {
-        return await response.json();
-      } catch {
-        console.warn("Empty JSON body");
+    try {
+      const response = await fetch(this.baseUrl, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      console.log('Response status:', response.status);
+      console.log('Response headers:', Object.fromEntries(response.headers.entries()));
+
+      // Capture session ID
+      const newSessionId = response.headers.get('mcp-session-id');
+      if (newSessionId && newSessionId !== this.sessionId) {
+        this.sessionId = newSessionId;
+        console.log('Session ID updated:', newSessionId);
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Error response body:', errorText);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}\nBody: ${errorText}`);
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      console.log('Response content-type:', contentType);
+
+      if (response.status === 204 || response.status === 202) {
         return null;
       }
-    } else if (contentType.includes("text/event-stream")) {
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      let fullText = "";
 
-      while (true) {
-        const { value, done } = await reader!.read();
-        if (done) break;
-        fullText += decoder.decode(value, { stream: true });
+      const responseText = await response.text();
+      console.log('Raw response text:', responseText);
+
+      if (contentType.includes('application/json') && responseText.trim()) {
+        try {
+          const parsed = JSON.parse(responseText);
+          console.log('Parsed response:', parsed);
+          return parsed;
+        } catch (e) {
+          console.error('JSON parse error:', e);
+          throw new Error(`Invalid JSON: ${responseText}`);
+        }
       }
 
-      // Extract last valid data block
-      const dataBlocks = fullText
-        .split("\n\n")
-        .filter(block => block.startsWith("data:"))
-        .map(line => line.replace(/^data:\s*/, "").trim());
-
-      const lastBlock = dataBlocks.pop();
-      if (!lastBlock) {
-        console.warn("SSE stream returned no usable data block.");
-        return null;
+      // Handle SSE response format
+      if (contentType.includes('text/event-stream') && responseText.trim()) {
+        try {
+          // Extract JSON from SSE format: "event: message\ndata: {json}"
+          const lines = responseText.split('\n');
+          const dataLine = lines.find(line => line.startsWith('data: '));
+          
+          if (dataLine) {
+            const jsonData = dataLine.replace('data: ', '');
+            const parsed = JSON.parse(jsonData);
+            console.log('Parsed SSE response:', parsed);
+            return parsed;
+          }
+        } catch (e) {
+          console.error('SSE parse error:', e);
+          throw new Error(`Invalid SSE format: ${responseText}`);
+        }
       }
 
-      try {
-        return JSON.parse(lastBlock);
-      } catch (e) {
-        console.error("Failed to parse SSE data as JSON:", lastBlock);
-        throw new Error("Invalid SSE response from MCP server");
-      }
-    } else {
-      throw new Error(`Unsupported Content-Type: ${contentType}`);
+      return responseText;
+    } catch (error) {
+      console.error('Request failed:', error);
+      throw error;
+    }
+  }
+
+  async testHealth() {
+    try {
+      const response = await fetch('http://localhost:3000/health');
+      const data = await response.json();
+      console.log('Health check:', data);
+      return data;
+    } catch (error) {
+      console.error('Health check failed:', error);
+      throw error;
     }
   }
 
   async initialize() {
-    const initRes = await this.makeRequest('POST', {
+    console.log('=== INITIALIZING MCP CLIENT ===');
+    
+    // First test health
+    await this.testHealth();
+
+    const initRequest = {
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
       params: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        clientInfo: { name: "gemini-mcp-client", version: "1.0.0" }
+        clientInfo: { name: "debug-client", version: "1.0.0" }
       }
-    });
+    };
 
-    await this.makeRequest('POST', {
+    const initRes = await this.makeRequest('POST', initRequest);
+
+    // Send initialized notification
+    const notificationRequest = {
       jsonrpc: "2.0",
       method: "notifications/initialized"
-    });
+    };
+
+    await this.makeRequest('POST', notificationRequest);
 
     return initRes;
   }
 
   async callTool(name: string, arguments_: Record<string, any>) {
-    return this.makeRequest('POST', {
+    console.log('=== CALLING TOOL ===');
+    
+    const toolRequest = {
       jsonrpc: "2.0",
-      id: 3,
+      id: 2,
       method: "tools/call",
       params: {
         name,
         arguments: arguments_
       }
-    });
+    };
+
+    return await this.makeRequest('POST', toolRequest);
   }
 
   async close() {
     if (!this.sessionId) return;
-
+    
+    console.log('=== CLOSING SESSION ===');
     try {
       await this.makeRequest('DELETE');
     } catch (err) {
-      console.error("Error closing MCP session:", err);
+      console.error("Error closing session:", err);
     }
-
     this.sessionId = null;
   }
 }
